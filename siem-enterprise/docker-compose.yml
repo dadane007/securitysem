@@ -1,0 +1,369 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# SIEM Enterprise — Docker Compose Production
+# WAF → Ingestion → ML → Risk → SOAR → Admin Console
+# ═══════════════════════════════════════════════════════════════════════════
+
+services:
+
+  # ─── PostgreSQL ──────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: siem-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-siem_enterprise}
+      POSTGRES_USER: ${POSTGRES_USER:-siem_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-SecurePass2024!}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    networks:
+      - siem-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-siem_admin} -d ${POSTGRES_DB:-siem_enterprise}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # ─── MinIO Data Lake ─────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: siem-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    networks:
+      - siem-network
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ─── Redis Cache ──────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: siem-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-RedisSecure2024}
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    networks:
+      - siem-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-RedisSecure2024}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ─── WAF Intelligent ─────────────────────────────────────────────────────
+  waf:
+    build:
+      context: ./waf
+      dockerfile: Dockerfile
+    image: siem-waf:latest
+    container_name: siem-waf
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD:-RedisSecure2024}@redis:6379
+      INGESTION_API_URL: http://ingestion:8001
+      WAF_MODE: ${WAF_MODE:-audit}
+      MAX_REQUESTS_PER_MINUTE: ${MAX_REQUESTS_PER_MINUTE:-100}
+    ports:
+      - "${WAF_PORT:-8080}:8080"
+    networks:
+      - siem-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ─── Ingestion Service ────────────────────────────────────────────────────
+  ingestion:
+    build:
+      context: ./ingestion
+      dockerfile: Dockerfile
+    image: siem-ingestion:latest
+    container_name: siem-ingestion
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-siem_admin}:${POSTGRES_PASSWORD:-SecurePass2024!}@postgres:5432/${POSTGRES_DB:-siem_enterprise}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-RedisSecure2024}@redis:6379
+    ports:
+      - "${INGESTION_PORT:-8001}:8001"
+    networks:
+      - siem-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # ─── ML Engine ────────────────────────────────────────────────────────────
+  ml-engine:
+    build:
+      context: ./ml-engine
+      dockerfile: Dockerfile
+    image: siem-ml:latest
+    container_name: siem-ml-engine
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-siem_admin}:${POSTGRES_PASSWORD:-SecurePass2024!}@postgres:5432/${POSTGRES_DB:-siem_enterprise}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-RedisSecure2024}@redis:6379
+      ANOMALY_THRESHOLD: ${ANOMALY_THRESHOLD:-0.7}
+      ML_MODE: ${ML_MODE:-auto}
+    ports:
+      - "${ML_PORT:-8002}:8002"
+    networks:
+      - siem-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ml-models:/app/models
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+
+  # ─── Risk Engine ──────────────────────────────────────────────────────────
+  risk-engine:
+    build:
+      context: ./risk-engine
+      dockerfile: Dockerfile
+    image: siem-risk:latest
+    container_name: siem-risk-engine
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-siem_admin}:${POSTGRES_PASSWORD:-SecurePass2024!}@postgres:5432/${POSTGRES_DB:-siem_enterprise}
+      ML_ENGINE_URL: http://ml-engine:8002
+      AUTOMATION_LEVEL: ${AUTOMATION_LEVEL:-semi-auto}
+      RISK_THRESHOLD_BLOCK: ${RISK_THRESHOLD_BLOCK:-0.9}
+      RISK_THRESHOLD_CAPTCHA: ${RISK_THRESHOLD_CAPTCHA:-0.7}
+    ports:
+      - "${RISK_PORT:-8003}:8003"
+    networks:
+      - siem-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ml-engine:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ─── SOAR Engine ──────────────────────────────────────────────────────────
+  soar:
+    build:
+      context: ./soar
+      dockerfile: Dockerfile
+    image: siem-soar:latest
+    container_name: siem-soar
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-siem_admin}:${POSTGRES_PASSWORD:-SecurePass2024!}@postgres:5432/${POSTGRES_DB:-siem_enterprise}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-RedisSecure2024}@redis:6379
+      WAF_API_URL: http://waf:8080
+      INGESTION_API_URL: http://ingestion:8001
+      ENABLE_AUTO_BLOCK: ${ENABLE_AUTO_BLOCK:-true}
+      ENABLE_CAPTCHA: ${ENABLE_CAPTCHA:-true}
+      BLOCK_DURATION_MINUTES: ${BLOCK_DURATION_MINUTES:-60}
+    ports:
+      - "${SOAR_PORT:-8004}:8004"
+    networks:
+      - siem-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      waf:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ─── Plan Generator ───────────────────────────────────────────────────────
+  plan-generator:
+    build:
+      context: ./plan-generator
+      dockerfile: Dockerfile
+    image: siem-plangen:latest
+    container_name: siem-plan-generator
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-siem_admin}:${POSTGRES_PASSWORD:-SecurePass2024!}@postgres:5432/${POSTGRES_DB:-siem_enterprise}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    ports:
+      - "${PLANGEN_PORT:-8005}:8005"
+    networks:
+      - siem-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ─── Admin API Backend ────────────────────────────────────────────────────
+  admin-api:
+    build:
+      context: ./admin-console/backend
+      dockerfile: Dockerfile
+    image: siem-admin-api:latest
+    container_name: siem-admin-api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-siem_admin}:${POSTGRES_PASSWORD:-SecurePass2024!}@postgres:5432/${POSTGRES_DB:-siem_enterprise}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-RedisSecure2024}@redis:6379
+      WAF_API_URL: http://waf:8080
+      ML_ENGINE_URL: http://ml-engine:8002
+      RISK_ENGINE_URL: http://risk-engine:8003
+      SOAR_API_URL: http://soar:8004
+      PLANGEN_API_URL: http://plan-generator:8005
+      INGESTION_API_URL: http://ingestion:8001
+      JWT_SECRET: ${JWT_SECRET:-ChangeThisInProduction!}
+      CORS_ORIGINS: "http://localhost:3000,http://localhost:5173"
+    ports:
+      - "${ADMIN_API_PORT:-8000}:8000"
+    networks:
+      - siem-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ingestion:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # ─── Admin Console Frontend ───────────────────────────────────────────────
+  admin-frontend:
+    build:
+      context: ./admin-console/frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ""
+    image: siem-admin-ui:latest
+    container_name: siem-admin-frontend
+    restart: unless-stopped
+    ports:
+      - "${ADMIN_UI_PORT:-3000}:80"
+    networks:
+      - siem-network
+    depends_on:
+      admin-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:80"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+# ─── Volumes ──────────────────────────────────────────────────────────────────
+volumes:
+  postgres-data:
+    name: siem-postgres-data
+  minio-data:
+    name: siem-minio-data
+  ml-models:
+    name: siem-ml-models
+
+# ─── Networks ─────────────────────────────────────────────────────────────────
+networks:
+  siem-network:
+    name: siem-enterprise-network
+    driver: bridge
